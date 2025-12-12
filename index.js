@@ -4,146 +4,190 @@ import admin from "firebase-admin";
 import { google } from "googleapis";
 import fs from "fs";
 
-// ----------------------------------------------------
-// NOUVELLE LOGIQUE POUR GÉRER LA CLÉ SECRÈTE (RENDER/LOCAL)
-// ----------------------------------------------------
-let SERVICE_ACCOUNT_KEY_CONTENT;
+// =======================================================
+// 1. CONFIGURATION ET INITIALISATION (AU DÉBUT)
+// =======================================================
 
-if (process.env.SERVICE_ACCOUNT_KEY) {
-    // 1. Sur Render : Utiliser la variable d'environnement (plus sécurisé)
-    try {
-        SERVICE_ACCOUNT_KEY_CONTENT = JSON.parse(process.env.SERVICE_ACCOUNT_KEY);
-    } catch (e) {
-        console.error("ERREUR : Impossible de parser la variable SERVICE_ACCOUNT_KEY.");
-        process.exit(1);
-    }
-} else {
-    // 2. En local (PC) : Lire le fichier local
-    try {
-        SERVICE_ACCOUNT_KEY_CONTENT = JSON.parse(fs.readFileSync("./google-service-account.json", "utf8"));
-    } catch (e) {
-        console.error("ERREUR CRITIQUE : Fichier google-service-account.json non trouvé. Assurez-vous d'avoir ce fichier en local.");
-        // Si la clé n'est pas trouvée, on empêche le serveur de démarrer
-        process.exit(1);
-    }
-}
-// ----------------------------------------------------
+// --- CHARGEMENT DES CLÉS ---
+// On essaie de lire la clé depuis les variables d'environnement (Render)
+// Sinon, on lit le fichier local (Développement)
+const SERVICE_ACCOUNT_KEY_CONTENT = JSON.parse(
+    process.env.SERVICE_ACCOUNT_KEY || fs.readFileSync("./google-service-account.json", "utf8")
+);
 
-
-// -------------------------------
-// GOOGLE CALENDAR AUTH
-// -------------------------------
-const SCOPES = ["https://www.googleapis.com/auth/calendar"];
-
-const auth = new google.auth.GoogleAuth({
-  credentials: SERVICE_ACCOUNT_KEY_CONTENT, // Utilise la clé chargée
-  scopes: SCOPES,
-});
-
-const calendar = google.calendar({ version: "v3", auth });
-
-// -------------------------------
-// FIREBASE INIT
-// -------------------------------
+// --- FIREBASE INIT ---
 admin.initializeApp({
-  credential: admin.credential.cert(SERVICE_ACCOUNT_KEY_CONTENT), // Utilise la clé chargée
+    // IMPORTANT : Utiliser la variable qui contient le JSON PARSÉ
+    credential: admin.credential.cert(SERVICE_ACCOUNT_KEY_CONTENT), 
 });
-
 const db = admin.firestore();
 
-// -------------------------------
-// EXPRESS APP
-// -------------------------------
+// --- GOOGLE CALENDAR AUTH ---
+const SCOPES = ["https://www.googleapis.com/auth/calendar"];
+const auth = new google.auth.GoogleAuth({
+    credentials: SERVICE_ACCOUNT_KEY_CONTENT, // Utiliser la variable PARSÉE pour l'auth Google
+    scopes: SCOPES,
+});
+const calendar = google.calendar({ version: "v3", auth });
+
+// --- EXPRESS APP INIT ---
 const app = express();
-// IMPORTANT : Activez CORS pour que le front-end sur Netlify puisse appeler Render
-app.use(cors()); 
+app.use(cors());
 app.use(express.json());
 
-// -------------------------------
-// API : CRÉER UN RENDEZ-VOUS
-// -------------------------------
-app.post("/api/book", async (req, res) => {
-  try {
-    const { date, time, clientName, phone } = req.body; // time est attendu au format "HH:MM"
-    
-    // --- Remplacez VOTRE_EMAIL_PERSONNEL@gmail.com par l'email de votre calendrier ! ---
-    const CALENDAR_ID = "rowan.blanc@gmail.com"; 
-    // -----------------------------------------------------------------------------------
 
+// =======================================================
+// 2. TÂCHES DE MAINTENANCE (NETTOYAGE)
+// =======================================================
 
-    if (!date || !time || !clientName || !phone) {
-      return res.status(400).json({ error: "Données manquantes" });
+async function cleanupOldAppointments() {
+    console.log("Démarrage du nettoyage des anciens rendez-vous...");
+
+    // 1. Calculer la date limite (il y a 7 jours)
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const limitDateString = sevenDaysAgo.toISOString().split('T')[0]; 
+
+    try {
+        const snapshot = await db.collection("appointments")
+            .where("date", "<=", limitDateString)
+            .get();
+
+        if (snapshot.empty) {
+            console.log("Aucun ancien rendez-vous de plus d'une semaine trouvé.");
+            return;
+        }
+
+        const batch = db.batch();
+        snapshot.docs.forEach(doc => {
+            batch.delete(doc.ref);
+        });
+
+        await batch.commit();
+        console.log(`✅ Nettoyage terminé. ${snapshot.size} rendez-vous ont été supprimés de Firestore.`);
+    } catch (error) {
+        console.error("❌ Erreur lors de l'opération de nettoyage Firestore:", error);
     }
+}
 
-    // Vérifier si le créneau est déjà pris (Firestore)
-    const snapshot = await db
-      .collection("appointments")
-      .where("date", "==", date)
-      .where("time", "==", time)
-      .get();
+// Exécuter le nettoyage au démarrage du serveur Render
+cleanupOldAppointments();
 
-    if (!snapshot.empty) {
-      return res.status(400).json({ error: "Créneau déjà réservé" });
+
+// =======================================================
+// 3. ROUTES API
+// =======================================================
+
+// --- ROUTE 1: VÉRIFIER L'ÉTAT D'OUVERTURE ---
+app.get("/api/status", async (req, res) => {
+    try {
+        const doc = await db.collection("settings").doc("status").get();
+
+        if (!doc.exists) {
+            // Document 'status' non trouvé, le salon est considéré comme OUVERT par défaut
+            return res.json({ is_open: true }); 
+        }
+
+        return res.json({ is_open: doc.data().is_open });
+
+    } catch (error) {
+        console.error("Erreur lors de la récupération du statut:", error);
+        // Erreur critique de la DB, on suppose que le système doit rester ouvert pour les réservations existantes.
+        res.status(500).json({ is_open: true, error: "Erreur serveur" });
     }
-
-    // --- CALCUL DE L'HEURE DE FIN (Ajout de 30 minutes) ---
-    const startTimeString = `${date}T${time}:00`;
-    const startDate = new Date(startTimeString);
-
-    if (isNaN(startDate)) {
-        return res.status(400).json({ error: "Format de date ou d'heure invalide." });
-    }
-    
-    startDate.setMinutes(startDate.getMinutes() + 30);
-
-    const endHour = String(startDate.getHours()).padStart(2, "0");
-    const endMinute = String(startDate.getMinutes()).padStart(2, "0");
-    const endTime = `${endHour}:${endMinute}`;
-    // --------------------------------------------------------
-
-
-    // 1. Enregistrer dans Firestore
-    await db.collection("appointments").add({
-      date,
-      time,
-      clientName,
-      phone,
-      status: "reserved",
-      createdAt: new Date()
-    });
-
-    // 2. Ajouter dans Google Calendar
-    const event = {
-      summary: `RDV coiffure – ${clientName}`,
-      description: `Téléphone : ${phone}`,
-      start: {
-        dateTime: `${date}T${time}:00`,
-        timeZone: "Europe/Paris",
-      },
-      end: {
-        dateTime: `${date}T${endTime}:00`, 
-        timeZone: "Europe/Paris",
-      },
-    };
-
-    await calendar.events.insert({
-      calendarId: CALENDAR_ID, // Utilise l'ID de votre calendrier personnel
-      requestBody: event,
-    });
-
-    res.json({ success: true, message: "Rendez-vous enregistré !" });
-
-  } catch (error) {
-    console.error("Erreur dans /api/book :", error);
-    res.status(500).json({ error: "Erreur serveur interne lors de la réservation." });
-  }
 });
 
-// -------------------------------
-// DÉMARRAGE SERVEUR (Configuration pour Render)
-// -------------------------------
-const PORT = process.env.PORT || 3000;
 
+// --- ROUTE 2: CRÉER UN RENDEZ-VOUS ---
+app.post("/api/book", async (req, res) => {
+    
+    // --- VÉRIFICATION DE L'ÉTAT D'OUVERTURE ---
+    try {
+        const statusDoc = await db.collection("settings").doc("status").get();
+        // Le serveur est bloqué si le document existe et is_open est FALSE
+        const isOpen = statusDoc.exists ? statusDoc.data().is_open : true; 
+
+        if (!isOpen) {
+            return res.status(403).json({ error: "Le salon est actuellement fermé. Les réservations ne sont pas acceptées." });
+        }
+    } catch (statusError) {
+        console.error("Erreur de vérification du statut:", statusError);
+        // On continue la réservation en cas d'erreur sur la vérification du statut
+    }
+    // ----------------------------------------
+
+    const { date, time, clientName, phone } = req.body; 
+
+    // Vérification des données entrantes (duplication de la destructuring corrigée)
+    if (!date || !time || !clientName || !phone) {
+        return res.status(400).json({ error: "Données manquantes" });
+    }
+
+    try {
+        // 1. Vérifier si le créneau est déjà pris (Firestore)
+        const snapshot = await db
+            .collection("appointments")
+            .where("date", "==", date)
+            .where("time", "==", time)
+            .get();
+
+        if (!snapshot.empty) {
+            return res.status(400).json({ error: "Créneau déjà réservé" });
+        }
+
+        // 2. Calcul de l'heure de fin (30 minutes)
+        const startTimeString = `${date}T${time}:00`;
+        const startDate = new Date(startTimeString);
+        
+        if (isNaN(startDate)) {
+            return res.status(400).json({ error: "Format de date ou d'heure invalide." });
+        }
+        
+        const endDate = new Date(startDate.getTime() + 30 * 60000); // Ajout de 30 minutes
+        const endTime = `${String(endDate.getHours()).padStart(2, "0")}:${String(endDate.getMinutes()).padStart(2, "0")}`;
+        
+        // 3. Enregistrer dans Firestore
+        await db.collection("appointments").add({
+            date,
+            time,
+            clientName,
+            phone,
+            status: "reserved",
+            createdAt: new Date()
+        });
+
+        // 4. Ajouter dans Google Calendar
+        const event = {
+            summary: `RDV coiffure – ${clientName}`,
+            description: `Téléphone : ${phone}`,
+            start: {
+                dateTime: `${date}T${time}:00`,
+                timeZone: "Europe/Paris",
+            },
+            end: {
+                dateTime: `${date}T${endTime}:00`, 
+                timeZone: "Europe/Paris",
+            },
+        };
+
+        await calendar.events.insert({
+            calendarId: "rowan.blanc@gmail.com", // **À vérifier :** Mettez votre ID de calendrier ici
+            requestBody: event,
+        });
+
+        res.json({ success: true, message: "Rendez-vous enregistré !" });
+
+    } catch (error) {
+        console.error("Erreur de réservation:", error);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+
+// =======================================================
+// 4. DÉMARRAGE SERVEUR
+// =======================================================
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Serveur démarré sur port ${PORT}`);
+    console.log(`Serveur démarré sur le port ${PORT}`);
 });
