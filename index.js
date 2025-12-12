@@ -177,7 +177,7 @@ app.post("/api/book", async (req, res) => {
         };
 
         await calendar.events.insert({
-            calendarId: "rowan.blanc@gmail.com", // **À vérifier :** Mettez votre ID de calendrier ici
+            calendarId: "msallaky@gmail.com", // **À vérifier :** Mettez votre ID de calendrier ici
             requestBody: event,
         });
         // 2. Insertion sur le deuxième calendrier
@@ -202,5 +202,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Serveur démarré sur le port ${PORT}`);
 });
+
 
 
