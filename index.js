@@ -4,6 +4,7 @@ import admin from "firebase-admin";
 import { google } from "googleapis";
 import fs from "fs";
 
+
 // =======================================================
 // 1. CONFIGURATION ET INITIALISATION (AU DÉBUT)
 // =======================================================
@@ -201,3 +202,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Serveur démarré sur le port ${PORT}`);
 });
+
