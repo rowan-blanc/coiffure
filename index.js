@@ -97,6 +97,11 @@ app.get("/api/status", async (req, res) => {
     }
 });
 
+// --- ROUTE POUR LE MONITORING (HEALTH CHECK) (NOUVEAU) ---
+app.get("/health", (req, res) => {
+    // Réponse rapide et simple pour garder le serveur actif
+    res.status(200).send("OK");
+});
 
 // --- ROUTE 2: CRÉER UN RENDEZ-VOUS ---
 app.post("/api/book", async (req, res) => {
@@ -196,4 +201,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Serveur démarré sur le port ${PORT}`);
 });
-
